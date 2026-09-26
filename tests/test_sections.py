@@ -52,6 +52,54 @@ def test_preheat_requires_a_durable_record_before_reporting_one(tmp_path: Path) 
         runtime.preheat.durable_temperature()
 
 
+def test_a_screen_reading_without_a_commit_never_opens_the_ramp_permit(tmp_path: Path) -> None:
+    """The operator confirming the temperature on screen must not release the ramp."""
+
+    runtime = manual_runtime(tmp_path)
+    runtime.preheat.measure("TS-PREHEAT", 87.5, reason="screen confirmation only")
+    assert runtime.preheat.is_durable() is False
+    assert runtime.gates.is_open("preheat-temperature-durable") is False
+    assert runtime.preheat.snapshot()["permit_open"] is False
+
+
+def test_an_out_of_window_commit_keeps_the_ramp_permit_closed(tmp_path: Path) -> None:
+    """A committed value that is out of spec is durable but must not permit ramping."""
+
+    runtime = manual_runtime(tmp_path)
+    record = runtime.preheat.persist_temperature("TS-PREHEAT", 70.0, reason="cold commit")
+    assert record["in_spec"] is False
+    assert runtime.preheat.is_durable() is True
+    assert runtime.gates.is_open("preheat-temperature-durable") is False
+
+
+def test_restart_without_any_commit_does_not_inherit_an_open_permit(tmp_path: Path) -> None:
+    """A reading that never reached the ledger must not look 'reached' after a power loss."""
+
+    first = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    first.preheat.measure("TS-PREHEAT", 87.5, reason="screen confirmation only")
+    second = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    assert second.preheat.is_durable() is False
+    assert second.gates.is_open("preheat-temperature-durable") is False
+
+
+def test_restart_reads_only_the_last_committed_preheat_value(tmp_path: Path) -> None:
+    """After re-heating, the gate and its evidence come from the final durable record."""
+
+    first = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    first.preheat.persist_temperature("TS-PREHEAT", 70.0, reason="stale cold commit")
+    assert first.gates.is_open("preheat-temperature-durable") is False
+    first.preheat.persist_temperature("TS-PREHEAT", 87.5, reason="re-committed after power loss")
+    assert first.gates.is_open("preheat-temperature-durable") is True
+
+    second = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    durable = second.preheat.durable_temperature()
+    assert durable["value_c"] == 87.5
+    assert durable["in_spec"] is True
+    gate = second.gates.get("preheat-temperature-durable")
+    assert gate.state == "open"
+    assert gate.evidence == "87.5C"
+
+
 def test_cooling_stop_opens_the_shutdown_permit(tmp_path: Path) -> None:
     runtime = sterilizing_runtime(tmp_path)
     runtime.control.start_hold(reason="test")

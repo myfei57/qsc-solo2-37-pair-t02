@@ -38,6 +38,7 @@ class PreheatSection:
         self._durable: dict[str, Any] | None = None
         self._history: list[dict[str, Any]] = []
         self._load()
+        self._reconcile_gate(reason="recovered durable preheat state")
 
     def _load(self) -> None:
         stored = self.store.try_read(self.document)
@@ -51,8 +52,22 @@ class PreheatSection:
     def persist(self) -> None:
         self.store.write(
             self.document,
-            {"target_c": self._target_c, "history": self._history},
+            {"target_c": self._target_c, "durable": self._durable, "history": self._history},
         )
+
+    def _reconcile_gate(self, *, reason: str) -> None:
+        """Derive the ramp permit solely from the last committed durable record."""
+
+        if self._committed_in_spec():
+            evidence = f"{float(self._durable['value_c']):g}C"  # type: ignore[index]
+            self.gates.open(gate_names.TEMPERATURE_DURABLE, reason=reason, evidence=evidence)
+        elif self.gates.is_open(gate_names.TEMPERATURE_DURABLE):
+            self.gates.close(gate_names.TEMPERATURE_DURABLE, reason=reason)
+
+    def _committed_in_spec(self) -> bool:
+        """True only when a durable record exists on disk and it is in spec."""
+
+        return self._durable is not None and bool(self._durable.get("in_spec"))
 
     @property
     def target_c(self) -> float:
@@ -75,23 +90,19 @@ class PreheatSection:
         return dict(entry)
 
     def measure(self, sensor_id: str, raw_c: float, *, reason: str) -> dict[str, Any]:
+        """Record a reading for the screen. This never releases the ramp permit."""
+
         reading = self.thermometry.record_reading(sensor_id, raw_c)
-        measured = {
+        return {
             "sensor": sensor_id,
             "value_c": reading.value,
             "generation": reading.generation,
             "in_spec": self.config.temperature.preheat_in_spec(reading.value),
             "reason": str(reason),
         }
-        self.gates.open(
-            gate_names.TEMPERATURE_DURABLE,
-            reason=str(reason),
-            evidence=f"{reading.value:g}C",
-        )
-        return measured
 
     def persist_temperature(self, sensor_id: str, raw_c: float, *, reason: str) -> dict[str, Any]:
-        """Durably record the preheat temperature and open the ramp permit."""
+        """Durably record the preheat temperature; only an in-spec record opens the ramp permit."""
 
         measured = self.measure(sensor_id, raw_c, reason=reason)
         record = {
@@ -104,6 +115,13 @@ class PreheatSection:
         }
         self._durable = record
         self.persist()
+        self._reconcile_gate(reason=reason)
+        self.audit.record(
+            "preheat-temperature",
+            "preheat",
+            f"{record['value_c']:g} C in_spec={str(record['in_spec']).lower()}",
+            cause=None,
+        )
         return dict(record)
 
     def durable_temperature(self) -> dict[str, Any]:

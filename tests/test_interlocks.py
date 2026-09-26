@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from uhtline.app.runtime import build_runtime
+from uhtline.core.clock import ManualClock
+from uhtline.core.config import fast_test_config
 from uhtline.errors import GateClosedError, LatchActiveError, StageOrderError, StaleWarrantyError, StateError
 from uhtline.stages import gates as gate_names
 from uhtline.stages import latches as latch_names
@@ -84,6 +87,42 @@ def test_ramp_is_refused_until_the_preheat_temperature_is_durable(tmp_path: Path
     with pytest.raises(GateClosedError) as failure:
         control.start_sterilization_ramp(137.0, reason="operator")
     assert failure.value.details["gate"] == gate_names.TEMPERATURE_DURABLE
+
+
+def test_a_screen_confirmation_without_a_commit_blocks_the_ramp(tmp_path: Path) -> None:
+    """The incident: the operator acknowledged preheat on screen but never committed it."""
+
+    runtime = manual_runtime(tmp_path)
+    control = runtime.control
+    control.open_batch("B-0001", "milk", reason="test")
+    control.start_intake(reason="test")
+    control.receive(700.0, 6.0, batch_id="B-0001", reason="test")
+    control.charge_balance(500.0, reason="test")
+    # 画面读数（甚至落在合格窗口内），但没有落账
+    reading = control.preheat.measure(PREHEAT_SENSOR, 87.5, reason="screen acknowledgement")
+    assert reading["in_spec"] is True
+    assert control.preheat.is_durable() is False
+    with pytest.raises(GateClosedError) as failure:
+        control.start_sterilization_ramp(137.0, reason="operator")
+    assert failure.value.details["gate"] == gate_names.TEMPERATURE_DURABLE
+
+
+def test_ramp_stays_blocked_after_a_power_loss_without_a_commit(tmp_path: Path) -> None:
+    """Restart must not release the ramp when no preheat value was ever committed."""
+
+    first = manual_runtime(tmp_path)
+    control = first.control
+    control.open_batch("B-0001", "milk", reason="test")
+    control.start_intake(reason="test")
+    control.receive(700.0, 6.0, batch_id="B-0001", reason="test")
+    control.charge_balance(500.0, reason="test")
+    control.preheat.measure(PREHEAT_SENSOR, 87.5, reason="screen acknowledgement")
+    first.persist()
+
+    restarted = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    assert restarted.preheat.is_durable() is False
+    with pytest.raises(GateClosedError):
+        restarted.control.start_sterilization_ramp(137.0, reason="operator after power loss")
 
 
 def test_persisting_an_out_of_window_temperature_keeps_the_ramp_permit_closed(tmp_path: Path) -> None:
