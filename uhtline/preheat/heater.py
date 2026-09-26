@@ -51,8 +51,33 @@ class PreheatSection:
     def persist(self) -> None:
         self.store.write(
             self.document,
-            {"target_c": self._target_c, "history": self._history},
+            {"target_c": self._target_c, "durable": self._durable, "history": self._history},
         )
+
+    def sync_permit(self) -> bool:
+        """Force the ramp permit to match the last booked preheat record.
+
+        A screen-only target never opens the permit: only an in-spec
+        temperature that was actually booked to durable storage does. On
+        restart the gate document may still claim "open" from an earlier
+        session, so the durable record is the single source of truth.
+        """
+
+        if self._durable is not None and bool(self._durable.get("in_spec")):
+            gate = self.gates.get(gate_names.TEMPERATURE_DURABLE)
+            if not gate.is_open:
+                self.gates.open(
+                    gate_names.TEMPERATURE_DURABLE,
+                    reason="recovered durable preheat record",
+                    evidence=f"{self._durable['value_c']:g}C",
+                )
+            return True
+        if self.gates.is_open(gate_names.TEMPERATURE_DURABLE):
+            self.gates.close(
+                gate_names.TEMPERATURE_DURABLE,
+                reason="no in-spec preheat temperature has been booked",
+            )
+        return False
 
     @property
     def target_c(self) -> float:
@@ -76,22 +101,20 @@ class PreheatSection:
 
     def measure(self, sensor_id: str, raw_c: float, *, reason: str) -> dict[str, Any]:
         reading = self.thermometry.record_reading(sensor_id, raw_c)
-        measured = {
+        return {
             "sensor": sensor_id,
             "value_c": reading.value,
             "generation": reading.generation,
             "in_spec": self.config.temperature.preheat_in_spec(reading.value),
             "reason": str(reason),
         }
-        self.gates.open(
-            gate_names.TEMPERATURE_DURABLE,
-            reason=str(reason),
-            evidence=f"{reading.value:g}C",
-        )
-        return measured
 
     def persist_temperature(self, sensor_id: str, raw_c: float, *, reason: str) -> dict[str, Any]:
-        """Durably record the preheat temperature and open the ramp permit."""
+        """Book the preheat temperature durably and open the ramp permit.
+
+        Reading alone never releases the ramp: the value has to be booked
+        here, and the permit opens only while the booked reading is in spec.
+        """
 
         measured = self.measure(sensor_id, raw_c, reason=reason)
         record = {
@@ -104,6 +127,23 @@ class PreheatSection:
         }
         self._durable = record
         self.persist()
+        if record["in_spec"]:
+            self.gates.open(
+                gate_names.TEMPERATURE_DURABLE,
+                reason=str(reason),
+                evidence=f"{record['value_c']:g}C",
+            )
+        else:
+            self.gates.close(
+                gate_names.TEMPERATURE_DURABLE,
+                reason=f"booked preheat {record['value_c']:g}C is outside the envelope",
+            )
+        self.audit.record(
+            "preheat-book",
+            "preheat",
+            f"booked {record['value_c']:g} C in_spec={str(record['in_spec']).lower()}",
+            cause=None,
+        )
         return dict(record)
 
     def durable_temperature(self) -> dict[str, Any]:
@@ -118,9 +158,13 @@ class PreheatSection:
         return [dict(item) for item in self._history[-max(0, int(limit)) :]]
 
     def snapshot(self) -> dict[str, Any]:
+        booked = self._durable
         return {
             "target_c": self.target_c,
-            "durable": self._durable,
+            "durable": booked,
+            "booked": booked is not None,
+            "booked_in_spec": booked is not None and bool(booked.get("in_spec")),
+            "booked_value_c": None if booked is None else booked.get("value_c"),
             "permit_open": self.gates.is_open(gate_names.TEMPERATURE_DURABLE),
             "history": self.history(5),
         }

@@ -240,6 +240,13 @@ class LineControl:
     def start_sterilization_ramp(self, target_c: float, *, reason: str) -> dict[str, Any]:
         self.gates.require_open(gate_names.TEMPERATURE_DURABLE, action="sterilization-ramp")
         self.latches.require_clear(latch_names.STERILIZATION_INTERLOCK, action="sterilization-ramp")
+        booked = self.preheat.durable_temperature()
+        if not booked.get("in_spec"):
+            raise StateError(
+                "the last booked preheat temperature is outside the envelope",
+                action="sterilization-ramp",
+                booked_c=booked.get("value_c"),
+            )
         self._require_stage(Stage.PREHEAT, action="sterilization-ramp")
         entry = self.uht.start_ramp(target_c, reason=reason)
         self.stages.enter(Stage.STERILIZE, reason=reason)

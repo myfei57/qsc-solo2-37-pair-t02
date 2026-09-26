@@ -143,6 +143,18 @@ def _define_equipment(gates: GateBoard, latches: LatchBoard) -> None:
         latches.define(name, description=description, clear_condition=clear_condition)
 
 
+def _recover_permits(runtime: Runtime) -> None:
+    """Reconcile permit gates against their recovered, booked evidence.
+
+    Gate snapshots are hints; after a power loss a gate may still advertise
+    "open" while the value that opened it was never made durable. Every
+    gate with a durable owner is re-derived from that owner's last booked
+    record, so a screen-only confirmation can never be mistaken for one.
+    """
+
+    runtime.preheat.sync_permit()
+
+
 def _publish_scopes(runtime: Runtime) -> None:
     for scope, payload in runtime.config.scopes().items():
         runtime.generations.ensure(scope, payload, reason="commissioning")
@@ -256,6 +268,7 @@ def build_runtime(
         control=control,
     )
     _define_equipment(gates, latches)
+    _recover_permits(runtime)
     _publish_scopes(runtime)
     _commission_sensors(runtime)
     runtime.persist()

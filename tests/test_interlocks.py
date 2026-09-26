@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from uhtline.app.runtime import build_runtime
+from uhtline.core.clock import ManualClock
+from uhtline.core.config import fast_test_config
 from uhtline.errors import GateClosedError, LatchActiveError, StageOrderError, StaleWarrantyError, StateError
 from uhtline.stages import gates as gate_names
 from uhtline.stages import latches as latch_names
@@ -97,6 +100,37 @@ def test_persisting_an_out_of_window_temperature_keeps_the_ramp_permit_closed(tm
     assert record["in_spec"] is False
     with pytest.raises(GateClosedError):
         control.start_sterilization_ramp(137.0, reason="operator")
+
+
+def test_ramp_stays_blocked_after_restart_when_the_operator_only_confirmed_on_screen(
+    tmp_path: Path,
+) -> None:
+    first = manual_runtime(tmp_path)
+    control = first.control
+    control.open_batch("B-0001", "milk", reason="test")
+    control.start_intake(reason="test")
+    control.receive(700.0, 6.0, batch_id="B-0001", reason="test")
+    control.charge_balance(500.0, reason="test")
+    control.persist_preheat_temperature(PREHEAT_SENSOR, 87.5, reason="operator")
+
+    import hashlib
+    import json
+    from uhtline.persistence.store import canonical_json
+
+    path = tmp_path / "documents" / "preheat.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["payload"]["durable"] = None
+    document["checksum"] = hashlib.sha256(canonical_json(document["payload"]).encode("utf-8")).hexdigest()
+    path.write_text(canonical_json(document), encoding="utf-8")
+
+    second = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    assert second.preheat.is_durable() is False
+    assert second.gates.is_open(gate_names.TEMPERATURE_DURABLE) is False
+    second.preheat.set_target(88.5, reason="screen only after power skip")
+    assert second.stages.current() is Stage.PREHEAT
+    with pytest.raises(GateClosedError) as failure:
+        second.control.start_sterilization_ramp(137.0, reason="reheat without booking")
+    assert failure.value.details["gate"] == gate_names.TEMPERATURE_DURABLE
 
 
 def test_ramp_is_refused_while_the_sterilization_interlock_is_set(tmp_path: Path) -> None:

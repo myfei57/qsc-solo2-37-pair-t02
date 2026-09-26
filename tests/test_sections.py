@@ -52,6 +52,71 @@ def test_preheat_requires_a_durable_record_before_reporting_one(tmp_path: Path) 
         runtime.preheat.durable_temperature()
 
 
+def test_setting_the_target_on_screen_does_not_open_the_ramp_permit(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.preheat.set_target(88.5, reason="operator screen")
+    assert runtime.preheat.is_durable() is False
+    assert runtime.gates.is_open("preheat-temperature-durable") is False
+    snapshot = runtime.preheat.snapshot()
+    assert snapshot["target_c"] == 88.5
+    assert snapshot["booked"] is False
+    assert snapshot["booked_value_c"] is None
+    assert snapshot["permit_open"] is False
+
+
+def test_booking_an_out_of_spec_temperature_keeps_the_permit_closed(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    record = runtime.preheat.persist_temperature("TS-PREHEAT", 70.0, reason="operator")
+    assert record["in_spec"] is False
+    assert runtime.preheat.is_durable() is True
+    assert runtime.gates.is_open("preheat-temperature-durable") is False
+    assert runtime.preheat.snapshot()["booked_in_spec"] is False
+
+
+def test_rebooking_in_spec_after_an_out_of_spec_value_reopens_the_permit(tmp_path: Path) -> None:
+    runtime = manual_runtime(tmp_path)
+    runtime.preheat.persist_temperature("TS-PREHEAT", 70.0, reason="operator")
+    assert runtime.gates.is_open("preheat-temperature-durable") is False
+    runtime.preheat.persist_temperature("TS-PREHEAT", 87.5, reason="operator")
+    assert runtime.preheat.durable_temperature()["value_c"] == 87.5
+    assert runtime.gates.is_open("preheat-temperature-durable") is True
+
+
+def test_restart_without_a_booking_closes_a_permit_left_open_on_disk(tmp_path: Path) -> None:
+    first = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    first.preheat.persist_temperature("TS-PREHEAT", 87.5, reason="operator")
+    assert first.gates.is_open("preheat-temperature-durable") is True
+
+    # Simulate the power-skip damage: the booking never reached the preheat
+    # document while the gate snapshot still advertises "open" on disk.
+    import hashlib
+    import json
+    from uhtline.persistence.store import canonical_json
+
+    path = tmp_path / "documents" / "preheat.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["payload"]["durable"] = None
+    document["checksum"] = hashlib.sha256(canonical_json(document["payload"]).encode("utf-8")).hexdigest()
+    path.write_text(canonical_json(document), encoding="utf-8")
+
+    second = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    assert second.preheat.is_durable() is False
+    assert second.gates.is_open("preheat-temperature-durable") is False
+    second.preheat.set_target(88.5, reason="operator screen")
+    assert second.gates.is_open("preheat-temperature-durable") is False
+    assert second.preheat.snapshot()["permit_open"] is False
+
+
+def test_restart_reads_the_last_booked_preheat_value(tmp_path: Path) -> None:
+    first = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    first.preheat.persist_temperature("TS-PREHEAT", 87.5, reason="first booking")
+    first.preheat.persist_temperature("TS-PREHEAT", 88.2, reason="second booking")
+    second = build_runtime(fast_test_config(), tmp_path, ManualClock())
+    assert second.preheat.durable_temperature()["value_c"] == 88.2
+    assert second.preheat.is_durable() is True
+    assert second.gates.is_open("preheat-temperature-durable") is True
+
+
 def test_cooling_stop_opens_the_shutdown_permit(tmp_path: Path) -> None:
     runtime = sterilizing_runtime(tmp_path)
     runtime.control.start_hold(reason="test")
